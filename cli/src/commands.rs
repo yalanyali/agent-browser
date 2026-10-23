@@ -1281,8 +1281,14 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         "connect" => {
             let endpoint = rest.first().ok_or_else(|| ParseError::MissingArguments {
                 context: "connect".to_string(),
-                usage: "connect <port|url>",
+                usage: "connect <port|url|ardia>",
             })?;
+            // Attach to the user's running Ardia (native/ardia.rs).
+            if *endpoint == "ardia" {
+                return Ok(
+                    json!({ "id": id, "action": "launch", "ardia": true, "front": flags.front }),
+                );
+            }
             // Check if it's a URL (ws://, wss://, http://, https://)
             if endpoint.starts_with("ws://")
                 || endpoint.starts_with("wss://")
@@ -3608,6 +3614,8 @@ mod tests {
             device: None,
             auto_connect: false,
             pin_tab: false,
+            ardia: false,
+            front: false,
             session_name: None,
             restore: None,
             restore_save: None,
@@ -5853,6 +5861,18 @@ mod tests {
         assert_eq!(cmd["action"], "launch");
         assert_eq!(cmd["cdpUrl"], "http://localhost:9222");
         assert!(cmd.get("cdpPort").is_none());
+    }
+
+    #[test]
+    fn test_connect_ardia() {
+        let cmd = parse_command(&args("connect ardia"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "launch");
+        assert_eq!(cmd["ardia"], true);
+        assert_eq!(cmd["front"], false);
+        let mut flags = default_flags();
+        flags.front = true;
+        let cmd = parse_command(&args("connect ardia"), &flags).unwrap();
+        assert_eq!(cmd["front"], true);
     }
 
     #[test]

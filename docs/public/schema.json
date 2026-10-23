@@ -152,6 +152,14 @@
       "type": "boolean",
       "description": "Pin the session to its bound tab and fail if that tab is gone."
     },
+    "ardia": {
+      "type": "boolean",
+      "description": "Attach to the user's running Ardia in a background tab of its own."
+    },
+    "front": {
+      "type": "boolean",
+      "description": "With ardia, allow focus changes (bring tabs to front, activate parked tabs)."
+    },
     "annotate": {
       "type": "boolean",
       "description": "Annotated screenshot with numbered element labels."

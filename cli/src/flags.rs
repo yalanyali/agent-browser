@@ -122,6 +122,8 @@ pub struct Config {
     pub cdp: Option<String>,
     pub auto_connect: Option<bool>,
     pub pin_tab: Option<bool>,
+    pub ardia: Option<bool>,
+    pub front: Option<bool>,
     pub headers: Option<String>,
     pub annotate: Option<bool>,
     pub color_scheme: Option<String>,
@@ -206,6 +208,8 @@ impl Config {
             cdp: other.cdp.or(self.cdp),
             auto_connect: other.auto_connect.or(self.auto_connect),
             pin_tab: other.pin_tab.or(self.pin_tab),
+            ardia: other.ardia.or(self.ardia),
+            front: other.front.or(self.front),
             headers: other.headers.or(self.headers),
             annotate: other.annotate.or(self.annotate),
             color_scheme: other.color_scheme.or(self.color_scheme),
@@ -462,6 +466,10 @@ pub struct Flags {
     pub device: Option<String>,
     pub auto_connect: bool,
     pub pin_tab: bool,
+    /// Attach to the user's running Ardia (`--ardia`, see native/ardia.rs).
+    pub ardia: bool,
+    /// Let an Ardia session move the user's focus (`--front`).
+    pub front: bool,
     pub session_name: Option<String>,
     pub annotate: bool,
     pub color_scheme: Option<String>,
@@ -668,6 +676,8 @@ pub fn parse_flags(args: &[String]) -> Flags {
         auto_connect: env_var_is_truthy("AGENT_BROWSER_AUTO_CONNECT")
             || config.auto_connect.unwrap_or(false),
         pin_tab: env_var_is_truthy("AGENT_BROWSER_PIN_TAB") || config.pin_tab.unwrap_or(false),
+        ardia: env_var_is_truthy("AGENT_BROWSER_ARDIA") || config.ardia.unwrap_or(false),
+        front: env_var_is_truthy("AGENT_BROWSER_FRONT") || config.front.unwrap_or(false),
         session_name: env::var("AGENT_BROWSER_SESSION_NAME")
             .ok()
             .or(config.session_name),
@@ -1040,6 +1050,20 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--ardia" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.ardia = val;
+                if consumed {
+                    i += 1;
+                }
+            }
+            "--front" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.front = val;
+                if consumed {
+                    i += 1;
+                }
+            }
             "--no-pin-tab" => {
                 let (val, consumed) = parse_bool_arg(args, i);
                 flags.pin_tab = !val;
@@ -1228,6 +1252,8 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--auto-connect",
         "--pin-tab",
         "--no-pin-tab",
+        "--ardia",
+        "--front",
         "--no-ca-cert",
         "--use-system-ca",
         "--annotate",
@@ -2114,6 +2140,17 @@ mod tests {
         let flags = parse_flags(&args("--hide-scrollbars open"));
         assert!(flags.hide_scrollbars);
         assert!(flags.cli_hide_scrollbars);
+    }
+
+    #[test]
+    fn test_ardia_flags() {
+        let flags = parse_flags(&args("--ardia --front open"));
+        assert!(flags.ardia);
+        assert!(flags.front);
+        assert_eq!(
+            clean_args(&args("--ardia --front open example.com")),
+            args("open example.com")
+        );
     }
 
     #[test]

@@ -141,6 +141,7 @@ fn attach_plugins_to_command(cmd: &mut serde_json::Value, plugins: &[plugins::Pl
 fn command_is_external_launch(cmd: &serde_json::Value) -> bool {
     cmd.get("action").and_then(|value| value.as_str()) == Some("launch")
         && (cmd.get("cdpUrl").is_some()
+            || cmd.get("ardia").is_some()
             || cmd.get("cdpPort").is_some()
             || cmd.get("provider").is_some()
             || cmd
@@ -217,6 +218,18 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
 
     if flags.auto_connect && flags.provider.is_some() {
         return Some("Cannot use --auto-connect and -p/--provider together");
+    }
+
+    if flags.ardia && (flags.cdp.is_some() || flags.auto_connect || flags.provider.is_some()) {
+        return Some("Cannot use --ardia with --cdp, --auto-connect or -p/--provider");
+    }
+    if flags.ardia && !flags.extensions.is_empty() {
+        return Some("Cannot use --extension with --ardia (extensions require local browser)");
+    }
+    if flags.ardia && flags.allowed_domains.is_some() {
+        return Some(
+            "Cannot use --allowed-domains with --ardia (Ardia refuses the Fetch domain it needs)",
+        );
     }
 
     if flags.provider.is_some() && !flags.extensions.is_empty() {
@@ -319,6 +332,7 @@ fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -
         && flags.cdp.is_none()
         && flags.provider.is_none()
         && !flags.auto_connect
+        && !flags.ardia
         && !command_is_external_launch(command)
 }
 
@@ -1819,6 +1833,8 @@ fn main() {
         engine: flags.engine.as_deref(),
         auto_connect: flags.auto_connect,
         pin_tab: flags.pin_tab,
+        ardia: flags.ardia,
+        front: flags.front,
         idle_timeout: flags.idle_timeout.as_deref(),
         default_timeout: flags.default_timeout,
         cdp: flags.cdp.as_deref(),
@@ -1878,6 +1894,35 @@ fn main() {
             Err(e) => Some((e.to_string(), None)),
         };
 
+        if let Some((msg, code)) = err {
+            if flags.json {
+                print_json_error_with_code(msg, code.as_deref());
+            } else {
+                eprintln!("{} {}", color::error_indicator(), msg);
+            }
+            exit(1);
+        }
+    }
+
+    // Attach to Ardia. Like --auto-connect, this is sent even when the daemon
+    // is already running so a restarted Ardia is picked up.
+    if flags.ardia {
+        let mut launch_cmd = json!({
+            "id": gen_id(),
+            "action": "launch",
+            "ardia": true,
+            "front": flags.front
+        });
+        attach_script_launch_options(&mut launch_cmd, &flags);
+        let err = match send_command(launch_cmd, &flags.session) {
+            Ok(resp) if resp.success => None,
+            Ok(resp) => Some((
+                resp.error
+                    .unwrap_or_else(|| "Ardia connection failed".to_string()),
+                resp.code,
+            )),
+            Err(e) => Some((e.to_string(), None)),
+        };
         if let Some((msg, code)) = err {
             if flags.json {
                 print_json_error_with_code(msg, code.as_deref());

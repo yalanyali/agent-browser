@@ -2,6 +2,7 @@
 pub mod a11y;
 #[allow(dead_code)]
 pub mod actions;
+pub mod ardia;
 #[allow(dead_code)]
 pub mod auth;
 #[allow(dead_code)]

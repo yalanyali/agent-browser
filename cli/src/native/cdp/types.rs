@@ -141,6 +141,9 @@ pub struct SetDiscoverTargetsParams {
 #[serde(rename_all = "camelCase")]
 pub struct CreateTargetParams {
     pub url: String,
+    /// Open without focusing the new tab (`ardia::FocusPolicy`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
 }
 
 #[derive(Debug, Deserialize)]

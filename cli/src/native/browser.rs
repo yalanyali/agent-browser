@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 
+use super::ardia::{self, FocusPolicy};
 use super::cdp::chrome::{auto_connect_cdp, launch_chrome, ChromeProcess, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::discovery::discover_cdp_url;
@@ -470,6 +471,11 @@ pub struct BrowserManager {
     /// launch rules such as extension-forced headed mode. Meaningless for
     /// attached browsers (browser_process is None).
     headless: bool,
+    /// Whether this session may move the user's focus.
+    focus: FocusPolicy,
+    /// Attached with `--ardia`: existing tabs belong to the user, so they are
+    /// attached but never probed or prepared until the agent switches to one.
+    ardia: bool,
 }
 
 /// Stable machine-readable prefix for "the bound tab no longer exists"
@@ -613,6 +619,8 @@ impl BrowserManager {
                 pin_tab: false,
                 bound_target_id: None,
                 bound_target_gone: None,
+                focus: FocusPolicy::UPSTREAM,
+                ardia: false,
                 headless,
             };
             if let Err(error) = manager.discover_and_attach_targets().await {
@@ -727,6 +735,8 @@ impl BrowserManager {
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
+            focus: FocusPolicy::UPSTREAM,
+            ardia: false,
             headless: true,
         };
 
@@ -755,6 +765,65 @@ impl BrowserManager {
         Ok(manager)
     }
 
+    /// Attach to the user's running Ardia (see `ardia.rs`). Commands Ardia
+    /// refuses fail locally, and the session never moves the user's focus
+    /// unless `front` is set.
+    pub async fn connect_ardia(front: bool) -> Result<Self, String> {
+        let ws_url = ardia::resolve_endpoint()?;
+        let client = CdpClient::connect(&ws_url)
+            .await?
+            .with_method_guard(ardia::check_method);
+        let mut manager = Self {
+            client: Arc::new(client),
+            browser_process: None,
+            ws_url,
+            pages: Vec::new(),
+            active_page_index: 0,
+            default_timeout_ms: 25_000,
+            download_path: None,
+            ignore_https_errors: false,
+            visited_origins: HashSet::new(),
+            next_tab_id: 1,
+            direct_page: false,
+            pin_tab: false,
+            bound_target_id: None,
+            bound_target_gone: None,
+            headless: false,
+            focus: FocusPolicy::ardia(front),
+            ardia: true,
+        };
+        if let Err(error) = manager.discover_and_attach_targets().await {
+            let _ = manager
+                .close_with_timeout(Some(FAILED_INITIALIZATION_CLOSE_TIMEOUT))
+                .await;
+            return Err(error);
+        }
+        Ok(manager)
+    }
+
+    pub fn is_ardia(&self) -> bool {
+        self.ardia
+    }
+
+    /// Enable domains on the active tab if its renderer answers. A parked tab
+    /// is left untouched. Returns whether the tab is usable.
+    pub async fn enable_active_if_responsive(&self) -> bool {
+        let Ok(session_id) = self.active_session_id().map(str::to_string) else {
+            return false;
+        };
+        self.renderer_responds(&session_id, RENDERER_PROBE_TIMEOUT_MS)
+            .await
+            && self.enable_domains(&session_id).await.is_ok()
+    }
+
+    /// `Target.createTarget` params that respect the focus policy.
+    fn create_target_params(&self, url: &str) -> CreateTargetParams {
+        CreateTargetParams {
+            url: url.to_string(),
+            background: !self.focus.may_steal_focus,
+        }
+    }
+
     pub async fn connect_auto() -> Result<Self, String> {
         let ws_url = auto_connect_cdp().await?;
         Self::connect_cdp(&ws_url).await
@@ -780,15 +849,17 @@ impl BrowserManager {
             .filter(should_track_target)
             .collect();
 
+        if page_targets.is_empty() && self.ardia {
+            // The caller opens the session's own tab.
+            return Ok(());
+        }
         if page_targets.is_empty() {
             // Create a new tab
             let result: CreateTargetResult = self
                 .client
                 .send_command_typed(
                     "Target.createTarget",
-                    &CreateTargetParams {
-                        url: "about:blank".to_string(),
-                    },
+                    &self.create_target_params("about:blank"),
                     None,
                 )
                 .await?;
@@ -844,6 +915,12 @@ impl BrowserManager {
                     title: target.title.clone(),
                     target_type: target.target_type.clone(),
                 });
+            }
+
+            // Ardia: every existing tab is the user's. Don't probe or prepare
+            // them; the caller opens or restores the session's own tab.
+            if self.ardia {
+                return Ok(());
             }
 
             // Enable domains on a live tab, not blindly on the first target.
@@ -989,6 +1066,10 @@ impl BrowserManager {
         // paused, so the probe times out without the tab being discarded.
         if dialog_session == Some(session_id) {
             return Ok(RendererState::DialogBlocked);
+        }
+        // Target.activateTarget focuses the tab and its window.
+        if !self.focus.may_steal_focus {
+            return Err(ardia::parked_tab_error());
         }
         match tokio::time::timeout(
             Duration::from_millis(REVIVED_RENDERER_TIMEOUT_MS),
@@ -1514,9 +1595,7 @@ impl BrowserManager {
             .client
             .send_command_typed(
                 "Target.createTarget",
-                &CreateTargetParams {
-                    url: "about:blank".to_string(),
-                },
+                &self.create_target_params("about:blank"),
                 None,
             )
             .await?;
@@ -1679,9 +1758,7 @@ impl BrowserManager {
             .client
             .send_command_typed(
                 "Target.createTarget",
-                &CreateTargetParams {
-                    url: target_url.to_string(),
-                },
+                &self.create_target_params(target_url),
                 None,
             )
             .await?;
@@ -1759,10 +1836,12 @@ impl BrowserManager {
         self.bind_active_target();
 
         // Bring tab to front
-        let _ = self
-            .client
-            .send_command("Page.bringToFront", None, Some(&session_id))
-            .await;
+        if self.focus.may_steal_focus {
+            let _ = self
+                .client
+                .send_command("Page.bringToFront", None, Some(&session_id))
+                .await;
+        }
 
         // A dialog-blocked tab cannot answer script evaluation until the dialog
         // is resolved, so fall back to the last known url/title instead of
@@ -1970,6 +2049,11 @@ impl BrowserManager {
     }
 
     pub async fn bring_to_front(&self) -> Result<(), String> {
+        if !self.focus.may_steal_focus {
+            return Err(
+                "bringtofront would move the user's focus; pass --front to allow it".to_string(),
+            );
+        }
         let session_id = self.active_session_id()?;
         self.client
             .send_command("Page.bringToFront", None, Some(session_id))
@@ -2439,6 +2523,8 @@ async fn initialize_lightpanda_manager(
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
+            focus: FocusPolicy::UPSTREAM,
+            ardia: false,
             headless: true,
         };
 
@@ -2548,6 +2634,8 @@ async fn initialize_obscura_manager(
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
+            focus: FocusPolicy::UPSTREAM,
+            ardia: false,
             headless: true,
         };
 
@@ -3430,6 +3518,8 @@ mod tests {
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
+            focus: FocusPolicy::UPSTREAM,
+            ardia: false,
             headless: true,
         }
     }
@@ -3490,6 +3580,8 @@ mod tests {
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
+            focus: FocusPolicy::UPSTREAM,
+            ardia: false,
             headless: true,
         };
         manager.close().await.unwrap();
@@ -4516,6 +4608,34 @@ mod tests {
             "a revived tab must report revived:true so the recovery is not silent"
         );
         assert_eq!(mgr.active_page_index, 1);
+    }
+
+    /// Under the Ardia focus policy a tab that does not answer is reported as
+    /// parked instead of being activated: activating focuses the tab and its
+    /// window. The mock tab is revivable, so a successful switch would prove
+    /// Target.activateTarget was sent.
+    #[tokio::test]
+    async fn test_tab_switch_reports_parked_tab_without_activating() {
+        let url = start_mock_cdp_browser_with_discarded_tab(true).await;
+        let mut mgr = BrowserManager::connect_cdp(&url).await.expect("connect");
+        mgr.focus = FocusPolicy::ardia(false);
+
+        let err = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+            .await
+            .expect("tab_switch must not hang on a parked tab")
+            .expect_err("a parked tab must not be activated");
+        assert!(err.contains("parked"), "{err}");
+        assert_eq!(
+            mgr.active_page_index, 0,
+            "a failed switch keeps the active tab"
+        );
+
+        mgr.focus = FocusPolicy::ardia(true);
+        let result = tokio::time::timeout(Duration::from_secs(20), mgr.tab_switch(1, None))
+            .await
+            .expect("tab_switch must not hang")
+            .expect("--front allows activating the tab");
+        assert_eq!(result["revived"], json!(true));
     }
 
     /// Regression test for #1528: when the dead tab cannot be revived, the

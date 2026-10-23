@@ -14,6 +14,7 @@ use crate::connection::{get_socket_dir, INTERNAL_DAEMON_SHUTDOWN_ACTION};
 use crate::validation::{is_valid_session_name, session_name_error};
 
 use super::a11y;
+use super::ardia;
 use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil};
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
@@ -380,11 +381,16 @@ enum AttachedTarget {
     CdpPort(u64),
     AutoConnect,
     Provider(String),
+    Ardia { front: bool },
 }
 
 impl AttachedTarget {
     /// Reads the connection target a launch command names, if any.
     fn named_by(cmd: &Value) -> Option<Self> {
+        if cmd.get("ardia").and_then(Value::as_bool) == Some(true) {
+            let front = cmd.get("front").and_then(Value::as_bool) == Some(true);
+            return Some(Self::Ardia { front });
+        }
         if let Some(url) = cmd.get("cdpUrl").and_then(Value::as_str) {
             return Some(Self::CdpUrl(url.to_string()));
         }
@@ -411,6 +417,10 @@ impl AttachedTarget {
             Self::CdpPort(port) => ("cdpPort", json!(port)),
             Self::AutoConnect => ("autoConnect", json!(true)),
             Self::Provider(provider) => ("provider", json!(provider)),
+            Self::Ardia { front } => {
+                cmd.insert("front".to_string(), json!(front));
+                ("ardia", json!(true))
+            }
         };
         cmd.insert(key.to_string(), value);
     }
@@ -1406,7 +1416,9 @@ impl DaemonState {
             let controls_active = filter.is_some() || has_proxy_creds;
             let setup_result = if let Some(ref mut mgr) = self.browser {
                 async {
-                    mgr.prepare_domains_pub(page_sid).await?;
+                    if !mgr.is_ardia() {
+                        mgr.prepare_domains_pub(page_sid).await?;
+                    }
                     if controls_active {
                         install_network_controls_for_session(
                             &mgr.client,
@@ -1543,7 +1555,9 @@ impl DaemonState {
                             None,
                         )
                         .await?;
-                    mgr.prepare_domains_pub(&attach.session_id).await?;
+                    if !mgr.is_ardia() {
+                        mgr.prepare_domains_pub(&attach.session_id).await?;
+                    }
                     if controls_active {
                         install_network_controls_for_session(
                             &mgr.client,
@@ -2784,6 +2798,7 @@ fn append_launch_policy_actions(
     }
 
     let local_launch = launch.get("provider").is_none()
+        && launch.get("ardia").is_none()
         && launch.get("cdpUrl").is_none()
         && launch.get("cdpPort").is_none()
         && !launch
@@ -3057,6 +3072,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                     let _ = mgr.ensure_page().await;
                 }
             }
+        }
+    }
+
+    // Ardia refuses the CDP methods some actions depend on.
+    if state.browser.as_ref().is_some_and(|mgr| mgr.is_ardia()) {
+        if let Some(error) = ardia::unsupported_action(action) {
+            return error_response(&id, &error);
         }
     }
 
@@ -3552,6 +3574,95 @@ async fn apply_tab_binding_on_attach_or_rollback(state: &mut DaemonState) -> Res
             Err(e)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ardia (`--ardia`, see ardia.rs)
+// ---------------------------------------------------------------------------
+
+fn ardia_launch_hash(front: bool, enable_features: &[String], init_script_paths: &[String]) -> u64 {
+    launch_hash(
+        &LaunchOptions::default(),
+        &[],
+        &[],
+        enable_features,
+        init_script_paths,
+        None,
+        "ardia",
+        front.then_some("front"),
+    )
+}
+
+async fn handle_ardia_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let front = cmd.get("front").and_then(Value::as_bool) == Some(true);
+    let requested_domains = allowed_domains_from_launch_command(cmd).unwrap_or_default();
+    if !requested_domains.is_empty() || !current_allowed_domains(state).await.is_empty() {
+        return Err(
+            "--allowed-domains is not supported with --ardia (Ardia refuses the Fetch domain it needs)"
+                .to_string(),
+        );
+    }
+    let enable_features =
+        string_array_from_command(cmd, "enable").unwrap_or_else(launch_enable_features_from_env);
+    let init_script_paths = string_array_from_command(cmd, "initScripts")
+        .unwrap_or_else(launch_init_script_paths_from_env);
+    let hash = ardia_launch_hash(front, &enable_features, &init_script_paths);
+
+    if let Some(ref mgr) = state.browser {
+        if mgr.is_ardia() && state.launch_hash == Some(hash) && mgr.is_connection_alive().await {
+            return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
+        }
+    }
+    let had_browser = state.browser.is_some() || state.active_provider_session.is_some();
+    if had_browser {
+        close_current_browser(state).await?;
+    }
+    state.ref_map.invalidate_all_documents();
+    state.session_setup = SessionSetup::default();
+    state.plugin_init_scripts.clear();
+
+    state.reset_input_state();
+    state.browser = Some(BrowserManager::connect_ardia(front).await?);
+    if let Err(error) = open_ardia_session_tab(state).await {
+        let _ = rollback_failed_launch(state).await;
+        return Err(error);
+    }
+    state.launch_hash = Some(hash);
+    state.subscribe_to_browser_events();
+    state.start_fetch_handler();
+    state.start_dialog_handler();
+    state.update_stream_client().await;
+    apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
+    Ok(json!({ "launched": true, "relaunchedBrowser": had_browser }))
+}
+
+fn ardia_env(name: &str) -> bool {
+    env::var(name).is_ok_and(|v| v == "1" || v == "true")
+}
+
+/// An Ardia session works in a tab of its own and never adopts one of the
+/// user's tabs: it reuses the tab it was bound to before (a daemon restart or
+/// relaunch) when that tab is still open and responsive, and otherwise opens
+/// a background tab. Pin-tab semantics keep tabs the user opens later from
+/// taking over the session.
+async fn open_ardia_session_tab(state: &mut DaemonState) -> Result<(), String> {
+    state.pin_tab = true;
+    let binding = tab_binding::load(&state.session_id).ok().flatten();
+    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+    mgr.set_pin_tab(true);
+    let reused = match binding {
+        Some(b) => {
+            mgr.restore_target_binding(&b.target_id, &b.url)
+                && mgr.enable_active_if_responsive().await
+        }
+        None => false,
+    };
+    if !reused {
+        mgr.tab_new(None, None).await?;
+    }
+    // Best effort: a failed write is retried after the next command.
+    let _ = maybe_persist_tab_binding(state);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4168,6 +4279,15 @@ async fn auto_launch(
         return handle_launch(&json!({ "action": "launch", "plugins": plugins }), state)
             .await
             .map(|_| ());
+    }
+    if ardia_env("AGENT_BROWSER_ARDIA") {
+        let front = ardia_env("AGENT_BROWSER_FRONT");
+        return handle_launch(
+            &json!({ "action": "launch", "ardia": true, "front": front }),
+            state,
+        )
+        .await
+        .map(|_| ());
     }
     if env::var("AGENT_BROWSER_CDP").is_ok()
         || env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok()
@@ -4997,6 +5117,9 @@ async fn handle_launch_for_target(
     state: &mut DaemonState,
     deadline: std::time::Duration,
 ) -> Result<Value, String> {
+    if cmd.get("ardia").and_then(Value::as_bool) == Some(true) {
+        return handle_ardia_launch(cmd, state).await;
+    }
     if cmd.get("cdpUrl").and_then(Value::as_str).is_some()
         || cmd.get("cdpPort").and_then(Value::as_u64).is_some()
         || cmd.get("autoConnect").and_then(Value::as_bool) == Some(true)
@@ -17225,6 +17348,21 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             resolve_launch_target(&cmd, Some(&attached)),
             Some(json!({ "action": "launch", "cdpPort": 9222, "allowedDomains": ["example.com"] }))
         );
+    }
+
+    #[test]
+    fn test_ardia_attach_round_trips_through_launch_target() {
+        let launch = json!({ "action": "launch", "ardia": true, "front": true });
+        let attached = AttachedTarget::from_launch_command(&launch).unwrap();
+        assert_eq!(attached, AttachedTarget::Ardia { front: true });
+        assert_eq!(
+            resolve_launch_target(&json!({ "action": "launch" }), Some(&attached)),
+            Some(launch)
+        );
+        // An explicit Ardia launch is never redirected to an earlier target.
+        let cdp = AttachedTarget::CdpPort(9222);
+        let own = json!({ "action": "launch", "ardia": true, "front": false });
+        assert_eq!(resolve_launch_target(&own, Some(&cdp)), None);
     }
 
     #[tokio::test]

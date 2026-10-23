@@ -1583,6 +1583,25 @@ This is useful when:
 - You want a zero-configuration connection to your existing browser
 - You don't want to track which port Chrome is using
 
+### Ardia
+
+Use `--ardia` to drive your running [Ardia](https://github.com/mantrakp04/ardia) browser, with your logins, without disturbing the window you are working in:
+
+```bash
+agent-browser --ardia open example.com
+agent-browser --ardia snapshot -i
+agent-browser connect ardia          # Same as --ardia, then later commands need no flag
+```
+
+agent-browser reads `ArdiaControl.json` from Ardia's data directory on every connect, with the same checks as the `ardia` CLI (regular file, owned by you, mode 0600, live pid). A restarted Ardia is picked up automatically. Set `ARDIA_DATA_DIR` to use a different Ardia instance.
+
+An Ardia session:
+
+- Works in a background tab of its own. It never adopts your current or first tab, and tabs you open later never take over the session. After a reconnect it reuses its tab when that tab is still open and responsive.
+- Never moves your focus: no `Page.bringToFront`, new tabs open in the background, and a tab that Ardia has parked is reported as parked instead of being activated. Pass `--front` to allow focus changes.
+- Touches your tabs only when told to: `tab list` shows them, and `tab <ref>` switches the session to one (without bringing it to the front) until you switch back or run `tab new`.
+- Respects Ardia's CDP allowlist. Commands that need refused methods (cookies, state save/load, viewport and other emulation, headers, offline, routes, upload, downloads, tracing, recording, screencast, WebMCP) fail immediately with a "not available on Ardia" message. `--allowed-domains` is rejected.
+
 ## Streaming (Browser Preview)
 
 Stream the browser viewport via WebSocket for live preview or "pair browsing" where a human can watch and interact alongside an AI agent.

@@ -198,6 +198,8 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
         init_scripts: &[],
         enable: &[],
         pin_tab: false,
+        ardia: false,
+        front: false,
         args: None,
         user_agent: None,
         proxy: None,

@@ -155,6 +155,9 @@ fn extract_command_id(msg: &str) -> Option<u64> {
     envelope.id.filter(|id| *id > 0)
 }
 
+/// Checks a CDP method before it is sent; `Err` fails the command locally.
+pub type MethodGuard = fn(&str) -> Result<(), String>;
+
 pub struct CdpClient {
     ws_tx: WsTx,
     socket: socket2::Socket,
@@ -170,6 +173,9 @@ pub struct CdpClient {
     keepalive_handle: Mutex<Option<JoinHandle<()>>>,
     private_sessions: PrivateSessions,
     method_taps: MethodTaps,
+    /// Fails refused methods locally for browsers that enforce a CDP
+    /// allowlist (Ardia), instead of sending them.
+    method_guard: Option<MethodGuard>,
 }
 
 /// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
@@ -439,6 +445,7 @@ impl CdpClient {
             keepalive_handle: Mutex::new(Some(keepalive_handle)),
             private_sessions,
             method_taps,
+            method_guard: None,
         })
     }
 
@@ -480,12 +487,23 @@ impl CdpClient {
         self.close_complete.store(true, Ordering::SeqCst);
     }
 
+    /// Restrict the commands this client sends; see `method_guard`.
+    pub fn with_method_guard(mut self, guard: MethodGuard) -> Self {
+        self.method_guard = Some(guard);
+        self
+    }
+
+    fn check_method(&self, method: &str) -> Result<(), String> {
+        self.method_guard.map_or(Ok(()), |guard| guard(method))
+    }
+
     pub async fn send_command(
         &self,
         method: &str,
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
+        self.check_method(method)?;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cmd = CdpCommand {
@@ -634,6 +652,7 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<(), String> {
+        self.check_method(method)?;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let cmd = CdpCommand {
             id,

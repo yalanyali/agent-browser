@@ -1722,7 +1722,8 @@ fn parity_tools() -> Vec<Value> {
             "Connect CDP",
             "Connect to a browser over CDP. With pinTab, the session is strictly bound to its own tab: it re-binds by target id after restarts and fails with a tab_gone error instead of adopting another tab. Structured errors include code=tab_gone, data.targetId, and optional sanitized data.lastUrl. Pass pinTab: false to explicitly disable a sticky pin; omit it to keep the current state. The session stays attached until agent_browser_close, so later tools without a connection target use the same browser.",
             json!({
-                "target": { "type": "string", "description": "CDP port or URL." },
+                "target": { "type": "string", "description": "CDP port or URL, or \"ardia\" to attach to the user's running Ardia in a background tab of its own." },
+                "front": { "type": "boolean", "description": "Ardia only: allow focus changes (bring tabs to front, activate parked tabs)." },
                 "pinTab": { "type": "boolean", "description": "Strict session-to-tab binding (sticky for the session). Explicit false disables a sticky pin; omitted leaves it unchanged." }
             }),
             &["target"],
@@ -2578,6 +2579,9 @@ fn call_one_string(arguments: &Value, command: &str, key: &str) -> Result<Value,
 fn call_connect(arguments: &Value) -> Result<Value, ProtocolError> {
     let mut args = vec!["connect".to_string()];
     args.push(required_string(arguments, "target")?);
+    if arguments.get("front").and_then(|v| v.as_bool()) == Some(true) {
+        args.push("--front".to_string());
+    }
     match arguments.get("pinTab").and_then(|v| v.as_bool()) {
         Some(true) => args.push("--pin-tab".to_string()),
         Some(false) => args.push("--no-pin-tab".to_string()),

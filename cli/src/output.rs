@@ -3296,7 +3296,7 @@ Examples:
             r##"
 agent-browser connect - Connect to browser via CDP
 
-Usage: agent-browser connect <port|url>
+Usage: agent-browser connect <port|url|ardia>
 
 Connects to a running browser instance via Chrome DevTools Protocol (CDP).
 This allows controlling browsers, Electron apps, or remote browser services.
@@ -3304,6 +3304,8 @@ This allows controlling browsers, Electron apps, or remote browser services.
 Arguments:
   <port>               Local port number (e.g., 9222)
   <url>                Full WebSocket URL (ws://, wss://, http://, https://)
+  ardia                The user's running Ardia (same as --ardia; add --front to
+                       allow focus changes)
 
 Supported URL formats:
   - Port number: 9222 (connects to http://localhost:9222)
@@ -4084,6 +4086,12 @@ Options:
                              to another tab when the bound tab is closed. JSON includes
                              data.targetId and optional sanitized data.lastUrl. Sticky per session.
   --no-pin-tab               Disable a sticky pin previously enabled with --pin-tab
+  --ardia                    Attach to the user's running Ardia (or AGENT_BROWSER_ARDIA env)
+                             Works in a background tab of its own, never adopts or focuses
+                             the user's tabs, and fails commands Ardia refuses up front.
+                             Reads ArdiaControl.json (ARDIA_DATA_DIR for another instance).
+  --front                    With --ardia, allow focus changes: bring tabs to front, open
+                             tabs in the foreground, activate parked tabs (or AGENT_BROWSER_FRONT)
   --color-scheme <scheme>    Color scheme: dark, light, no-preference (or AGENT_BROWSER_COLOR_SCHEME)
   --download-path <path>     Default download directory (or AGENT_BROWSER_DOWNLOAD_PATH)
   --content-boundaries       Wrap page output in boundary markers (or AGENT_BROWSER_CONTENT_BOUNDARIES)
@@ -4177,6 +4185,9 @@ Environment:
                                  stopped. After daemon exit, inspect and stop the browser in Cloud.
   AGENT_BROWSER_AUTO_CONNECT     Auto-discover and connect to running Chrome
   AGENT_BROWSER_PIN_TAB          Pin the session to its bound tab (strict tab binding)
+  AGENT_BROWSER_ARDIA            Attach to the user's running Ardia (--ardia)
+  AGENT_BROWSER_FRONT            Let an Ardia session change focus (--front)
+  ARDIA_DATA_DIR                 Ardia data directory holding Chromium/ArdiaControl.json
   AGENT_BROWSER_ALLOW_FILE_ACCESS Allow file:// URLs to access local files
   AGENT_BROWSER_HIDE_SCROLLBARS  Hide scrollbars in headless Chromium screenshots (default: true)
   AGENT_BROWSER_COLOR_SCHEME     Color scheme preference (dark, light, no-preference)
@@ -4241,6 +4252,7 @@ Examples:
   agent-browser --cdp 9222 snapshot      # Connect via CDP port
   agent-browser --cdp 9222 --pin-tab open example.com  # Pin session to its own tab
   agent-browser --auto-connect snapshot  # Auto-discover running Chrome
+  agent-browser --ardia open example.com # Use your Ardia in a background tab
   agent-browser stream enable            # Start runtime streaming on an auto-selected port
   agent-browser stream status            # Inspect runtime streaming state
   agent-browser --color-scheme dark open example.com  # Dark mode
